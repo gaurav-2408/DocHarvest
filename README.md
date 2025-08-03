@@ -3,3 +3,5 @@ Receipt and invoice upload via UI, API, or S3  AI-based text and table extractio
 
 Tasks:
 [x]-connect git with AWS
+
+test-trigger
