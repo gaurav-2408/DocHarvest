@@ -6,3 +6,4 @@ Tasks:
 [] - tag trigger pipeline
 
 test-trigger
+test-tagbased trigger
