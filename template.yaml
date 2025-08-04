@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: DocHarvest - Document Processing with AWS Step Functions
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.9
+    MemorySize: 512
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: docharvest
+        LOG_LEVEL: INFO
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+Resources:
+  # S3 Bucket for document storage
+  DocumentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-documents-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt DocumentUploadHandler.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+                  - Name: suffix
+                    Value: .jpg
+                  - Name: suffix
+                    Value: .png
+                  - Name: suffix
+                    Value: .tiff
+
+  # IAM Role for Step Functions
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSStepFunctionsFullAccess
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*'
+        - PolicyName: TextractPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:*
+                Resource: '*'
+        - PolicyName: S3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${DocumentBucket}/*"
+
+  # Lambda Functions
+  DocumentUploadHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/document_upload/
+      Handler: app.lambda_handler
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref DocumentBucket
+            Events: s3:ObjectCreated:*
+      Environment:
+        Variables:
+          STEP_FUNCTION_ARN: !Ref DocumentProcessingStateMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !Ref DocumentProcessingStateMachine
+
+  DocumentValidationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/document_validation/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          DOCUMENT_BUCKET: !Ref DocumentBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentBucket
+
+  TextractProcessingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/textract_processing/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          DOCUMENT_BUCKET: !Ref DocumentBucket
+      Policies:
+        - TextractFullAccessPolicy: {}
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentBucket
+
+  DataExtractionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/data_extraction/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          DOCUMENT_BUCKET: !Ref DocumentBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DocumentBucket
+
+  NotificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/notification/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          DOCUMENT_BUCKET: !Ref DocumentBucket
+
+  # API Gateway for manual triggers
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+
+  ManualTriggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/functions/manual_trigger/
+      Handler: app.lambda_handler
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /process-document
+            Method: POST
+      Environment:
+        Variables:
+          STEP_FUNCTION_ARN: !Ref DocumentProcessingStateMachine
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !Ref DocumentProcessingStateMachine
+
+  # Step Functions State Machine
+  DocumentProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub "${AWS::StackName}-document-processing-${Environment}"
+      RoleArn: !GetAtt StepFunctionRole.Arn
+      Definition:
+        StartAt: ValidateDocument
+        States:
+          ValidateDocument:
+            Type: Task
+            Resource: !GetAtt DocumentValidationFunction.Arn
+            Next: CheckValidation
+            Catch:
+              - ErrorEquals: ["DocumentValidationError"]
+                Next: HandleValidationError
+            ResultPath: "$.validation"
+
+          CheckValidation:
+            Type: Choice
+            Choices:
+              - Variable: "$.validation.isValid"
+                BooleanEquals: true
+                Next: ProcessWithTextract
+              - Variable: "$.validation.isValid"
+                BooleanEquals: false
+                Next: HandleValidationError
+
+          ProcessWithTextract:
+            Type: Task
+            Resource: !GetAtt TextractProcessingFunction.Arn
+            Next: ExtractData
+            Catch:
+              - ErrorEquals: ["TextractError"]
+                Next: HandleTextractError
+            ResultPath: "$.textract"
+
+          ExtractData:
+            Type: Task
+            Resource: !GetAtt DataExtractionFunction.Arn
+            Next: SendNotification
+            Catch:
+              - ErrorEquals: ["DataExtractionError"]
+                Next: HandleExtractionError
+            ResultPath: "$.extractedData"
+
+          SendNotification:
+            Type: Task
+            Resource: !GetAtt NotificationFunction.Arn
+            End: true
+            ResultPath: "$.notification"
+
+          HandleValidationError:
+            Type: Task
+            Resource: !GetAtt NotificationFunction.Arn
+            Parameters:
+              errorType: "ValidationError"
+              message: "Document validation failed"
+              documentKey: "$.documentKey"
+            End: true
+
+          HandleTextractError:
+            Type: Task
+            Resource: !GetAtt NotificationFunction.Arn
+            Parameters:
+              errorType: "TextractError"
+              message: "Textract processing failed"
+              documentKey: "$.documentKey"
+            End: true
+
+          HandleExtractionError:
+            Type: Task
+            Resource: !GetAtt NotificationFunction.Arn
+            Parameters:
+              errorType: "ExtractionError"
+              message: "Data extraction failed"
+              documentKey: "$.documentKey"
+            End: true
+
+Outputs:
+  DocumentBucketName:
+    Description: "S3 Bucket for document storage"
+    Value: !Ref DocumentBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-DocumentBucket"
+
+  StepFunctionArn:
+    Description: "Step Function ARN"
+    Value: !Ref DocumentProcessingStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StepFunctionArn"
+
+  ApiGatewayUrl:
+    Description: "API Gateway URL for manual triggers"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/process-document"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiGatewayUrl"
+
+  StepFunctionName:
+    Description: "Step Function Name"
+    Value: !Ref DocumentProcessingStateMachine
+    Export:
+      Name: !Sub "${AWS::StackName}-StepFunctionName"
